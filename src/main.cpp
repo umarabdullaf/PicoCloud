@@ -8,6 +8,7 @@
 // WIFI CONFIGURATION
 // ======================================
 
+// Keep your existing WiFi credentials here.
 const char* WIFI_SSID = "LUTTAPPI";
 const char* WIFI_PASSWORD = "umarabdullaf";
 
@@ -25,6 +26,8 @@ const char* WIFI_PASSWORD = "umarabdullaf";
 // ======================================
 
 WebServer server(80);
+
+const char* WEBSITE_ROOT = "/websites";
 
 // ======================================
 // MIME TYPE DETECTION
@@ -45,203 +48,257 @@ String getContentType(String filename) {
     if (filename.endsWith(".ico"))  return "image/x-icon";
     if (filename.endsWith(".json")) return "application/json";
     if (filename.endsWith(".txt"))  return "text/plain";
+    if (filename.endsWith(".pdf"))  return "application/pdf";
 
     return "application/octet-stream";
 }
 
 // ======================================
-// SD CARD DIRECTORY TREE
+// GET DIRECTORY NAME
 // ======================================
 
-void printDirectoryTree(File dir, String indent = "") {
+String getDirectoryName(String path) {
 
-    while (true) {
-
-        File entry = dir.openNextFile();
-
-        if (!entry) {
-            break;
-        }
-
-        Serial.print(indent);
-
-        if (entry.isDirectory()) {
-
-            Serial.print("|-- ");
-            Serial.print(entry.name());
-            Serial.println("/");
-
-            printDirectoryTree(entry, indent + "|   ");
-
-        } else {
-
-            Serial.print("|-- ");
-            Serial.print(entry.name());
-
-            Serial.print(" (");
-            Serial.print(entry.size());
-            Serial.println(" bytes)");
-        }
-
-        entry.close();
+    while (path.endsWith("/")) {
+        path.remove(path.length() - 1);
     }
+
+    int lastSlash = path.lastIndexOf('/');
+
+    if (lastSlash >= 0) {
+        return path.substring(lastSlash + 1);
+    }
+
+    return path;
 }
 
 // ======================================
-// VALIDATE SD CARD STRUCTURE
+// WEBSITE DISCOVERY
 // ======================================
 
-void checkSDStructure() {
+void listWebsites() {
 
-    Serial.println("\n========== SD CARD STRUCTURE ==========");
+    Serial.println();
+    Serial.println("Available websites:");
 
-    File root = SD.open("/");
+    File root = SD.open(WEBSITE_ROOT);
 
     if (!root || !root.isDirectory()) {
-
-        Serial.println("ERROR: Cannot open SD root!");
+        Serial.println("Website directory not found.");
         return;
     }
 
-    Serial.println("SD CARD/");
-    printDirectoryTree(root);
+    int count = 0;
+
+    File entry = root.openNextFile();
+
+    while (entry) {
+
+        if (entry.isDirectory()) {
+
+            count++;
+
+            String name = getDirectoryName(entry.name());
+
+            Serial.print(count);
+            Serial.print(". ");
+            Serial.println(name);
+        }
+
+        entry.close();
+        entry = root.openNextFile();
+    }
 
     root.close();
 
-    Serial.println("\n========== STRUCTURE VALIDATION ==========");
+    Serial.print("\nTotal websites: ");
+    Serial.println(count);
+    Serial.println();
+}
 
-    const char* requiredPaths[] = {
+// ======================================
+// ROOT PAGE
+// ======================================
 
-        "/websites",
-        "/websites/site1",
-        "/websites/site1/index.html",
-        "/websites/site2",
-        "/websites/site2/index.html",
-        "/storage",
-        "/storage/Documents",
-        "/storage/Files",
-        "/config"
-    };
+void handleRoot() {
 
-    for (const char* path : requiredPaths) {
+    String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>PicoCloud</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: #f4f4f4;
+                padding: 30px;
+            }
+            .container {
+                max-width: 600px;
+                margin: auto;
+                background: white;
+                padding: 25px;
+                border-radius: 10px;
+            }
+            a {
+                display: block;
+                padding: 12px;
+                margin: 10px 0;
+                background: #eeeeee;
+                color: #222;
+                text-decoration: none;
+                border-radius: 5px;
+            }
+            a:hover {
+                background: #dddddd;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>PicoCloud</h1>
+            <h3>Hosted Websites</h3>
+    )rawliteral";
 
-        Serial.print(path);
-        Serial.print(" : ");
+    File root = SD.open(WEBSITE_ROOT);
 
-        if (SD.exists(path)) {
-            Serial.println("FOUND");
-        } else {
-            Serial.println("MISSING");
+    if (!root || !root.isDirectory()) {
+        html += "<p>No websites directory found.</p>";
+    }
+    else {
+
+        int count = 0;
+
+        File entry = root.openNextFile();
+
+        while (entry) {
+
+            if (entry.isDirectory()) {
+
+                String name = getDirectoryName(entry.name());
+
+                html += "<a href=\"/";
+                html += name;
+                html += "/\">";
+                html += name;
+                html += "</a>";
+
+                count++;
+            }
+
+            entry.close();
+            entry = root.openNextFile();
+        }
+
+        root.close();
+
+        if (count == 0) {
+            html += "<p>No websites hosted yet.</p>";
         }
     }
 
-    Serial.println("========================================\n");
+    html += R"rawliteral(
+        </div>
+    </body>
+    </html>
+    )rawliteral";
+
+    server.send(200, "text/html", html);
 }
 
 // ======================================
 // SERVE WEBSITE FILES
 // ======================================
 
+
 void handleWebsite() {
 
     String uri = server.uri();
 
-    String basePath;
-    String relativePath;
+    Serial.print("Incoming URL: ");
+    Serial.println(uri);
 
-    // Select website
-
-    if (uri == "/" ||
-        uri == "/site1" ||
-        uri.startsWith("/site1/")) {
-
-        basePath = "/websites/site1";
-
-        relativePath = uri.substring(6);
-
-    }
-
-    else if (uri == "/site2" ||
-             uri.startsWith("/site2/")) {
-
-        basePath = "/websites/site2";
-
-        relativePath = uri.substring(6);
-
-    }
-
-    else {
-
-        server.send(404, "text/plain", "Website not found");
-        return;
-    }
-
-    // Default homepage
-
-    if (relativePath.length() == 0 ||
-        relativePath == "/") {
-
-        relativePath = "/index.html";
-    }
-
-    // Prevent directory traversal
-
-    if (relativePath.indexOf("..") >= 0 ||
-        relativePath.indexOf('\\') >= 0) {
+    // Reject directory traversal
+    if (uri.indexOf("..") >= 0 ||
+        uri.indexOf('\\') >= 0) {
 
         server.send(400, "text/plain", "Invalid path");
         return;
     }
 
-    String filePath = basePath + relativePath;
+    // Extract website name
+    String requestedPath = uri.substring(1);
 
-    Serial.println("\n========== HTTP REQUEST ==========");
+    int slashPosition = requestedPath.indexOf('/');
 
-    Serial.print("URL requested: ");
-    Serial.println(uri);
+    String websiteName = requestedPath;
 
-    Serial.print("SD file requested: ");
-    Serial.println(filePath);
+    if (slashPosition >= 0) {
+        websiteName = requestedPath.substring(0, slashPosition);
+    }
 
-    // Check whether file exists
-
-    if (!SD.exists(filePath)) {
-
-        Serial.println("ERROR: FILE NOT FOUND!");
-
-        server.send(404, "text/plain", "File not found on SD card");
-
+    if (websiteName.length() == 0) {
+        server.send(404, "text/plain", "Website not found");
         return;
     }
 
-    // Open file
+    // Validate website directory
+    String basePath = String(WEBSITE_ROOT) + "/" + websiteName;
+
+    File websiteDir = SD.open(basePath);
+
+    if (!websiteDir || !websiteDir.isDirectory()) {
+
+        if (websiteDir) websiteDir.close();
+
+        server.send(404, "text/plain", "Website not found");
+        return;
+    }
+
+    websiteDir.close();
+
+    // Redirect URL without trailing slash
+    if (slashPosition == -1) {
+
+        server.sendHeader("Location", uri + "/");
+        server.send(302, "text/plain", "Redirecting");
+        return;
+    }
+
+    // Extract requested file
+    String relativePath = requestedPath.substring(slashPosition);
+
+    if (relativePath == "/") {
+        relativePath = "/index.html";
+    }
+
+    String filePath = basePath + relativePath;
+
+    Serial.print("SD card file: ");
+    Serial.println(filePath);
+
+    if (!SD.exists(filePath)) {
+
+        server.send(404, "text/plain", "File not found");
+        return;
+    }
 
     File file = SD.open(filePath, FILE_READ);
 
     if (!file || file.isDirectory()) {
 
-        Serial.println("ERROR: Cannot open requested file!");
+        if (file) file.close();
 
         server.send(404, "text/plain", "Invalid file");
-
         return;
     }
 
-    Serial.print("File size: ");
-    Serial.println(file.size());
-
-    String contentType = getContentType(filePath);
-
-    Serial.print("Content type: ");
-    Serial.println(contentType);
-
-    server.streamFile(file, contentType);
+    server.streamFile(file, getContentType(filePath));
 
     file.close();
-
-    Serial.println("File served successfully!");
-    Serial.println("==================================");
 }
+
 
 // ======================================
 // WIFI CONNECTION
@@ -273,62 +330,41 @@ void connectWiFi() {
 void setup() {
 
     Serial.begin(115200);
-
     delay(1000);
 
-    Serial.println("\n==============================");
-    Serial.println("       PICOCLOUD v0.3");
-    Serial.println("==============================");
+    Serial.println("\n================================");
+    Serial.println("       PICOCLOUD v0.4");
+    Serial.println("================================");
 
     // Initialize SPI
-
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
     // Initialize SD card
-
-    Serial.println("\nInitializing SD card...");
+    Serial.println("Initializing SD card...");
 
     if (!SD.begin(SD_CS, SPI, 4000000)) {
 
         Serial.println("SD CARD INITIALIZATION FAILED!");
-
         return;
     }
 
     Serial.println("SD card initialized successfully!");
 
-    // Display SD card size
-
-    Serial.print("SD Card Capacity: ");
-
-    Serial.print(SD.cardSize() / (1024 * 1024));
-
-    Serial.println(" MB");
-
-    // Display directory structure
-
-    checkSDStructure();
-
     // Connect WiFi
-
     connectWiFi();
 
-    // Website routing
+    // Discover websites
+    listWebsites();
 
-    server.on("/", HTTP_GET, handleWebsite);
-
+    // Configure routes
+    server.on("/", HTTP_GET, handleRoot);
     server.onNotFound(handleWebsite);
 
-    // Start HTTP server
-
+    // Start server
     server.begin();
 
-    Serial.println("\nHTTP server started!");
-
-    Serial.println("Website 1: /site1/");
-    Serial.println("Website 2: /site2/");
-
-    Serial.println("\nPicoCloud is ready!");
+    Serial.println("HTTP server started!");
+    Serial.println("================================");
 }
 
 // ======================================
