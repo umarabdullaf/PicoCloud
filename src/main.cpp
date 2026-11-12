@@ -32,6 +32,8 @@ WebServer server(80);
 
 String getContentType(String filename) {
 
+    filename.toLowerCase();
+
     if (filename.endsWith(".html")) return "text/html";
     if (filename.endsWith(".css"))  return "text/css";
     if (filename.endsWith(".js"))   return "application/javascript";
@@ -48,6 +50,95 @@ String getContentType(String filename) {
 }
 
 // ======================================
+// SD CARD DIRECTORY TREE
+// ======================================
+
+void printDirectoryTree(File dir, String indent = "") {
+
+    while (true) {
+
+        File entry = dir.openNextFile();
+
+        if (!entry) {
+            break;
+        }
+
+        Serial.print(indent);
+
+        if (entry.isDirectory()) {
+
+            Serial.print("|-- ");
+            Serial.print(entry.name());
+            Serial.println("/");
+
+            printDirectoryTree(entry, indent + "|   ");
+
+        } else {
+
+            Serial.print("|-- ");
+            Serial.print(entry.name());
+
+            Serial.print(" (");
+            Serial.print(entry.size());
+            Serial.println(" bytes)");
+        }
+
+        entry.close();
+    }
+}
+
+// ======================================
+// VALIDATE SD CARD STRUCTURE
+// ======================================
+
+void checkSDStructure() {
+
+    Serial.println("\n========== SD CARD STRUCTURE ==========");
+
+    File root = SD.open("/");
+
+    if (!root || !root.isDirectory()) {
+
+        Serial.println("ERROR: Cannot open SD root!");
+        return;
+    }
+
+    Serial.println("SD CARD/");
+    printDirectoryTree(root);
+
+    root.close();
+
+    Serial.println("\n========== STRUCTURE VALIDATION ==========");
+
+    const char* requiredPaths[] = {
+
+        "/websites",
+        "/websites/site1",
+        "/websites/site1/index.html",
+        "/websites/site2",
+        "/websites/site2/index.html",
+        "/storage",
+        "/storage/Documents",
+        "/storage/Files",
+        "/config"
+    };
+
+    for (const char* path : requiredPaths) {
+
+        Serial.print(path);
+        Serial.print(" : ");
+
+        if (SD.exists(path)) {
+            Serial.println("FOUND");
+        } else {
+            Serial.println("MISSING");
+        }
+    }
+
+    Serial.println("========================================\n");
+}
+
+// ======================================
 // SERVE WEBSITE FILES
 // ======================================
 
@@ -55,34 +146,38 @@ void handleWebsite() {
 
     String uri = server.uri();
 
-    // Allow only the two configured websites
     String basePath;
+    String relativePath;
 
-    if (uri == "/" || uri.startsWith("/site1/") ||
-        uri == "/site1") {
+    // Select website
+
+    if (uri == "/" ||
+        uri == "/site1" ||
+        uri.startsWith("/site1/")) {
 
         basePath = "/websites/site1";
+
+        relativePath = uri.substring(6);
+
     }
-    else if (uri.startsWith("/site2/") || uri == "/site2") {
+
+    else if (uri == "/site2" ||
+             uri.startsWith("/site2/")) {
 
         basePath = "/websites/site2";
+
+        relativePath = uri.substring(6);
+
     }
+
     else {
+
         server.send(404, "text/plain", "Website not found");
         return;
     }
 
-    // Remove the website prefix from the requested URL
-    String relativePath = "";
-
-    if (uri.startsWith("/site1")) {
-        relativePath = uri.substring(6);
-    }
-    else if (uri.startsWith("/site2")) {
-        relativePath = uri.substring(6);
-    }
-
     // Default homepage
+
     if (relativePath.length() == 0 ||
         relativePath == "/") {
 
@@ -90,6 +185,7 @@ void handleWebsite() {
     }
 
     // Prevent directory traversal
+
     if (relativePath.indexOf("..") >= 0 ||
         relativePath.indexOf('\\') >= 0) {
 
@@ -99,28 +195,52 @@ void handleWebsite() {
 
     String filePath = basePath + relativePath;
 
-    Serial.print("Requested file: ");
+    Serial.println("\n========== HTTP REQUEST ==========");
+
+    Serial.print("URL requested: ");
+    Serial.println(uri);
+
+    Serial.print("SD file requested: ");
     Serial.println(filePath);
+
+    // Check whether file exists
 
     if (!SD.exists(filePath)) {
 
-        server.send(404, "text/plain", "File not found");
+        Serial.println("ERROR: FILE NOT FOUND!");
+
+        server.send(404, "text/plain", "File not found on SD card");
+
         return;
     }
+
+    // Open file
 
     File file = SD.open(filePath, FILE_READ);
 
     if (!file || file.isDirectory()) {
 
+        Serial.println("ERROR: Cannot open requested file!");
+
         server.send(404, "text/plain", "Invalid file");
+
         return;
     }
 
+    Serial.print("File size: ");
+    Serial.println(file.size());
+
     String contentType = getContentType(filePath);
+
+    Serial.print("Content type: ");
+    Serial.println(contentType);
 
     server.streamFile(file, contentType);
 
     file.close();
+
+    Serial.println("File served successfully!");
+    Serial.println("==================================");
 }
 
 // ======================================
@@ -153,40 +273,62 @@ void connectWiFi() {
 void setup() {
 
     Serial.begin(115200);
+
     delay(1000);
 
     Serial.println("\n==============================");
-    Serial.println("       PICOCLOUD v0.2");
+    Serial.println("       PICOCLOUD v0.3");
     Serial.println("==============================");
 
     // Initialize SPI
+
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
     // Initialize SD card
-    Serial.println("Initializing SD card...");
+
+    Serial.println("\nInitializing SD card...");
 
     if (!SD.begin(SD_CS, SPI, 4000000)) {
 
         Serial.println("SD CARD INITIALIZATION FAILED!");
+
         return;
     }
 
     Serial.println("SD card initialized successfully!");
 
+    // Display SD card size
+
+    Serial.print("SD Card Capacity: ");
+
+    Serial.print(SD.cardSize() / (1024 * 1024));
+
+    Serial.println(" MB");
+
+    // Display directory structure
+
+    checkSDStructure();
+
     // Connect WiFi
+
     connectWiFi();
 
     // Website routing
+
     server.on("/", HTTP_GET, handleWebsite);
+
     server.onNotFound(handleWebsite);
 
-    // Start server
+    // Start HTTP server
+
     server.begin();
 
-    Serial.println("HTTP server started!");
+    Serial.println("\nHTTP server started!");
 
     Serial.println("Website 1: /site1/");
     Serial.println("Website 2: /site2/");
+
+    Serial.println("\nPicoCloud is ready!");
 }
 
 // ======================================
