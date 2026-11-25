@@ -625,17 +625,33 @@ document.getElementById('newFolderButton').addEventListener('click',async()=>{
   catch(error){alert(error.message);}
 });
 document.getElementById('uploadButton').addEventListener('click',()=>picker.click());
-picker.addEventListener('change',async()=>{
-  if(!picker.files.length)return;
-  const form=new FormData();
-  for(const file of picker.files)form.append('files',file,file.name);
-  summaryEl.textContent='Uploading '+picker.files.length+' file(s)…';
-  try{
-    const response=await fetch(apiURL('/api/storage/upload',currentPath),{method:'POST',body:form});
-    const data=await readApiResponse(response);
-    picker.value='';await loadDirectory();
-    if(data.message)summaryEl.textContent=data.message;
-  }catch(error){summaryEl.textContent='Upload failed';alert(error.message);await loadDirectory();}
+const CHUNK = 32 * 1024;
+picker.addEventListener('change', async () => {
+  if (!picker.files.length) return;
+  const files = Array.from(picker.files);
+  try {
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      let offset = 0;
+      do {
+        const blob = f.slice(offset, offset + CHUNK);
+        const form = new FormData();
+        form.append('chunk', blob, 'chunk');
+        const url = '/api/storage/upload?path=' + encodeURIComponent(currentPath) +
+                    '&name=' + encodeURIComponent(f.name) + '&offset=' + offset;
+        await readApiResponse(await fetch(url, { method: 'POST', body: form }));
+        offset += blob.size;
+        summaryEl.textContent = 'Uploading ' + f.name + ' (' + (i + 1) + '/' + files.length + ') – ' +
+                                Math.round(offset * 100 / Math.max(f.size, 1)) + '%';
+      } while (offset < f.size);
+    }
+    summaryEl.textContent = 'Upload complete';
+  } catch (error) {
+    summaryEl.textContent = 'Upload failed';
+    alert(error.message);
+  }
+  picker.value = '';
+  await loadDirectory();
 });
 loadDirectory();
 </script>
@@ -735,10 +751,14 @@ String extractUploadFilename(String filename) {
 }
 
 void handleStorageUploadData() {
-
-  Serial.printf("[UPLOAD] Status: %d | URI: %s\n",
-              server.upload().status, server.uri().c_str());
   HTTPUpload& upload = server.upload();
+
+  // Log only the start and end of each upload. Printing on every block at
+  // 115200 baud slows uploads and starves the tunnel.
+  if (upload.status == UPLOAD_FILE_START || upload.status == UPLOAD_FILE_END) {
+    Serial.printf("[UPLOAD] Status: %d | URI: %s\n",
+                  upload.status, server.uri().c_str());
+  }
 
   if (upload.status == UPLOAD_FILE_START) {
     if (!uploadRequestStarted) {
@@ -773,21 +793,35 @@ void handleStorageUploadData() {
       return;
     }
 
-    String safeFilename = extractUploadFilename(String(upload.filename));
+    String requestedName = server.hasArg("name") ? server.arg("name") : String(upload.filename);
+    String safeFilename = extractUploadFilename(requestedName);
     if (!isSafeSegment(safeFilename)) {
       if (uploadError.length() == 0) uploadError = "Invalid filename";
       return;
     }
 
+    uint32_t offset = static_cast<uint32_t>(server.arg("offset").toInt());
     String target = joinPath(uploadTargetDirectory, safeFilename);
-    if (SD.exists(target)) {
-      if (uploadError.length() == 0) uploadError = "A file with that name already exists: " + safeFilename;
-      return;
+
+    if (offset == 0) {
+      if (SD.exists(target)) {
+        if (uploadError.length() == 0) uploadError = "A file with that name already exists: " + safeFilename;
+        return;
+      }
+      uploadFile = SD.open(target, FILE_WRITE);
+    } else {
+      File existing = SD.open(target, FILE_READ);
+      bool ok = existing && !existing.isDirectory() && existing.size() == offset;
+      if (existing) existing.close();
+      if (!ok) {
+        if (uploadError.length() == 0) uploadError = "Chunk out of order for " + safeFilename;
+        return;
+      }
+      uploadFile = SD.open(target, FILE_APPEND);
     }
 
-    uploadFile = SD.open(target, FILE_WRITE);
     if (!uploadFile) {
-      if (uploadError.length() == 0) uploadError = "Could not create file: " + safeFilename;
+      if (uploadError.length() == 0) uploadError = "Could not open file: " + safeFilename;
       return;
     }
 
