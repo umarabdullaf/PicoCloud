@@ -6,8 +6,8 @@
 #include <SuperDMZ.h>
 
 // ============================================================
-// PICOCloud v0.7
-// Public website hosting + authenticated personal storage + SuperDMZ remote access
+// PICOCloud v0.8
+// Public website hosting + cookie-based login + storage manager + SuperDMZ
 // ============================================================
 
 // ------------------------- Wi-Fi -----------------------------
@@ -20,9 +20,7 @@ const char* WIFI_PASSWORD = "umarabdullaf";
 const char* SUPERDMZ_TOKEN = "0e35cd9461fd9b2299600df13e3631894c4779cb0f779f53";
 
 // ---------------------- Authentication -----------------------
-// Change BOTH values before using PicoCloud.
-// The browser will show its native username/password prompt.
-// The browser will show its native username/password prompt.
+// Login credentials for the PicoCloud login page.
 const char* AUTH_USERNAME = "jensen";
 const char* AUTH_PASSWORD = "nvidia";
 
@@ -37,7 +35,8 @@ const char* AUTH_PASSWORD = "nvidia";
 static const uint16_t HTTP_PORT = 80;
 static const char* WEBSITE_ROOT = "/websites";
 static const char* STORAGE_ROOT = "/storage";
-static const char* AUTH_REALM = "PicoCloud private area";
+static const char* SESSION_COOKIE = "pico_session=";
+static const uint32_t SESSION_LIFETIME_MS = 12UL * 60UL * 60UL * 1000UL;
 static const size_t MAX_ZIP_ENTRIES = 120;
 static const uint8_t MAX_DELETE_DEPTH = 16;
 
@@ -46,6 +45,8 @@ SuperDMZ tunnel;
 std::vector<String> publicWebsites;
 bool sdReady = false;
 bool tunnelStartAttempted = false;
+String activeSessionToken;
+unsigned long sessionCreatedAt = 0;
 
 // Upload state. WebServer calls the upload callback for each multipart
 // file; this state is reset whenever a new file starts.
@@ -201,10 +202,75 @@ String getContentType(String filename) {
   return "application/octet-stream";
 }
 
-bool requireAuthentication() {
-  if (server.authenticate(AUTH_USERNAME, AUTH_PASSWORD)) return true;
-  server.requestAuthentication(BASIC_AUTH, AUTH_REALM);
+String makeSessionToken() {
+  char token[33];
+  for (uint8_t i = 0; i < 4; ++i) {
+    uint32_t value = esp_random();
+    snprintf(token + i * 8, 9, "%08lx", static_cast<unsigned long>(value));
+  }
+  token[32] = '\0';
+  return String(token);
+}
+
+bool hasValidSession() {
+  if (activeSessionToken.length() != 32) return false;
+  if (millis() - sessionCreatedAt > SESSION_LIFETIME_MS) {
+    activeSessionToken = "";
+    return false;
+  }
+  String cookie = server.header("Cookie");
+  int start = cookie.indexOf(SESSION_COOKIE);
+  if (start < 0) return false;
+  start += strlen(SESSION_COOKIE);
+  int end = cookie.indexOf(';', start);
+  String supplied = end < 0 ? cookie.substring(start) : cookie.substring(start, end);
+  supplied.trim();
+  return supplied.length() == activeSessionToken.length() && supplied == activeSessionToken;
+}
+
+bool requireAuthentication(bool jsonResponse = false) {
+  if (hasValidSession()) return true;
+  if (jsonResponse) {
+    server.send(401, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"Please log in again\"}");
+  } else {
+    server.sendHeader("Location", "/login", true);
+    server.send(302, "text/plain; charset=utf-8", "Login required");
+  }
   return false;
+}
+
+const char LOGIN_HTML[] PROGMEM = R"LOGIN(
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PicoCloud Login</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f3f5f9;font-family:Arial,sans-serif;color:#182230}.card{width:min(390px,calc(100% - 32px));background:white;padding:30px;border:1px solid #e5e9ef;border-radius:16px;box-shadow:0 8px 30px #15223812}h1{margin:0 0 8px}.muted{color:#667085;font-size:14px;margin:0 0 24px}label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}input{width:100%;padding:12px;border:1px solid #ccd4df;border-radius:8px;font:inherit}button{width:100%;margin-top:20px;padding:12px;border:0;border-radius:8px;background:#1f5eff;color:white;font-weight:650;font-size:15px;cursor:pointer}#error{color:#bd2525;font-size:13px;min-height:18px;margin-top:12px}</style></head><body><main class="card"><h1>PicoCloud</h1><p class="muted">Sign in to your private dashboard</p><form method="post" action="/login"><label for="username">Username</label><input id="username" name="username" autocomplete="username" required><label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button type="submit">Sign in</button></form><div id="error"></div></main><script>if(new URLSearchParams(location.search).has("error"))document.getElementById("error").textContent="Incorrect username or password";</script></body></html>
+)LOGIN";
+
+void handleLoginPage() {
+  if (hasValidSession()) { server.sendHeader("Location", "/", true); server.send(302, "text/plain", "Redirecting"); return; }
+  server.send_P(200, PSTR("text/html; charset=utf-8"), LOGIN_HTML);
+  if (server.hasArg("error")) {
+    // Login page remains static; query parameter is handled by the small script below.
+  }
+}
+
+void handleLoginSubmit() {
+  if (server.arg("username") == AUTH_USERNAME && server.arg("password") == AUTH_PASSWORD) {
+    activeSessionToken = makeSessionToken();
+    sessionCreatedAt = millis();
+    server.sendHeader("Set-Cookie", String(SESSION_COOKIE) + activeSessionToken + "; Path=/; HttpOnly; SameSite=Lax");
+    server.sendHeader("Location", "/", true);
+    server.send(303, "text/plain; charset=utf-8", "Signed in");
+  } else {
+    server.sendHeader("Location", "/login?error=1", true);
+    server.send(303, "text/plain; charset=utf-8", "Invalid credentials");
+  }
+}
+
+void handleLogout() {
+  activeSessionToken = "";
+  sessionCreatedAt = 0;
+  server.sendHeader("Set-Cookie", "pico_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+  server.sendHeader("Location", "/login", true);
+  server.send(303, "text/plain; charset=utf-8", "Signed out");
 }
 
 void sendJsonError(int statusCode, const String& message) {
@@ -320,8 +386,7 @@ void handleHomePage() {
   html += F(".muted{color:#667085;font-size:14px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}");
   html += F(".add{border:0;border-radius:50%;width:44px;height:44px;background:#1f5eff;color:#fff;font-size:28px;line-height:1;cursor:pointer;box-shadow:0 3px 10px #1f5eff40}");
   html += F(".add:active{transform:scale(.96)}#websiteStatus{font-size:13px;color:#667085;margin:10px 0;white-space:pre-wrap}.hidden{display:none}</style></head><body><main><h1>PicoCloud</h1>");
-  html += F("<p class='muted'>Private dashboard</p><a class='item' href='/storage/'>Open personal storage</a>");
-  html += F("<div class='section-head'><h2>Hosted websites</h2><button class='add' id='addWebsite' type='button' aria-label='Upload new website folder' title='Upload new website folder'>+</button></div>");
+  html += F("<p class='muted'>Private dashboard</p><a class='item' href='/storage/'>Open personal storage</a><a class='item' href='/logout' onclick=\"event.preventDefault();fetch('/logout',{method:'POST'}).then(()=>location.href='/login')\">Log out</a>");  html += F("<div class='section-head'><h2>Hosted websites</h2><button class='add' id='addWebsite' type='button' aria-label='Upload new website folder' title='Upload new website folder'>+</button></div>");
   html += F("<input id='websiteFolder' class='hidden' type='file' webkitdirectory directory multiple>");
   html += F("<p class='muted'>Select a website folder containing index.html and its supporting files. The folder name becomes its website address.</p>");
   html += F("<div id='websiteStatus' role='status'></div>");
@@ -358,7 +423,7 @@ folderInput.addEventListener('change',async()=>{
   statusBox.textContent='Uploading '+files.length+' file(s)… Keep this page open.';
   try{
     const response=await fetch('/api/websites/upload',{method:'POST',body:form});
-    const result=await response.json();
+    const raw=await response.text();let result;try{result=JSON.parse(raw);}catch(_){throw new Error(response.status===401?'Session expired. Please log in again.':'Unexpected server response ('+response.status+').');}
     if(!response.ok||!result.ok)throw new Error(result.error||'Website upload failed');
     statusBox.textContent='Website uploaded successfully. Refreshing dashboard…';
     location.reload();
@@ -441,10 +506,10 @@ const char STORAGE_HTML[] PROGMEM = R"PICOHTML(
 </style>
 </head>
 <body>
-<header class="topbar"><div class="brand">PicoCloud <span>/ Storage</span></div><button class="btn" onclick="location.href='/'">Dashboard</button></header>
+<header class="topbar"><div class="brand">PicoCloud <span>/ Storage</span></div><div><button class="btn" onclick="location.href='/'">Dashboard</button> <button class="btn" onclick="fetch('/logout',{method:'POST'}).then(()=>location.href='/login')">Log out</button></div></header>
 <main class="wrap">
 <section class="panel">
- <div class="toolbar"><nav id="breadcrumbs" class="breadcrumbs"></nav><div class="controls"><input id="filePicker" class="upload-input" type="file" multiple><button class="btn primary" id="uploadButton">＋ Upload</button></div></div>
+ <div class="toolbar"><nav id="breadcrumbs" class="breadcrumbs"></nav><div class="controls"><input id="filePicker" class="upload-input" type="file" multiple><button class="btn" id="newFolderButton">＋ New folder</button><button class="btn primary" id="uploadButton">＋ Upload</button></div></div>
  <div id="summary" class="summary">Loading files…</div>
  <div id="fileList" class="file-list"><div class="empty">Loading storage…</div></div>
 </section>
@@ -467,6 +532,7 @@ function storageURL(path){
   return '/storage/' + path.split('/').map(encodeURIComponent).join('/') + '/';
 }
 function apiURL(endpoint,path){return endpoint+'?path='+encodeURIComponent(path||'');}
+async function readApiResponse(response){const text=await response.text();let data;try{data=JSON.parse(text);}catch(_){throw new Error(response.status===401?'Session expired. Please log in again.':'Server returned an unexpected response ('+response.status+').');}if(!response.ok||!data.ok)throw new Error(data.error||'Request failed');return data;}
 function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function humanSize(n){
   if(n<1024)return n+' B'; if(n<1024*1024)return (n/1024).toFixed(1)+' KB';
@@ -516,8 +582,7 @@ async function loadDirectory(){
   listEl.innerHTML='<div class="empty">Loading files…</div>';
   try{
     const response=await fetch(apiURL('/api/storage/list',currentPath),{cache:'no-store'});
-    const data=await response.json();
-    if(!response.ok||!data.ok)throw new Error(data.error||'Could not load this folder');
+    const data=await readApiResponse(response);
     entries=data.entries||[];
     entries.sort((a,b)=>a.type===b.type?a.name.localeCompare(b.name):(a.type==='dir'?-1:1));
     render();
@@ -546,12 +611,19 @@ listEl.addEventListener('click',async event=>{
     if(!confirm(promptText+'\n\n'+item.name))return;
     try{
       const response=await fetch(apiURL('/api/storage/delete',itemPath),{method:'POST'});
-      const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'Delete failed');
+      const data=await readApiResponse(response);
       await loadDirectory();
     }catch(error){alert(error.message);}
   }
 });
 document.addEventListener('click',event=>{if(!event.target.closest('.actions'))hideMenus();});
+document.getElementById('newFolderButton').addEventListener('click',async()=>{
+  const name=prompt('New folder name:');if(name===null)return;
+  const clean=name.trim();if(!clean)return;
+  const form=new URLSearchParams();form.set('path',currentPath);form.set('name',clean);
+  try{const response=await fetch('/api/storage/mkdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:form.toString()});await readApiResponse(response);await loadDirectory();}
+  catch(error){alert(error.message);}
+});
 document.getElementById('uploadButton').addEventListener('click',()=>picker.click());
 picker.addEventListener('change',async()=>{
   if(!picker.files.length)return;
@@ -560,7 +632,7 @@ picker.addEventListener('change',async()=>{
   summaryEl.textContent='Uploading '+picker.files.length+' file(s)…';
   try{
     const response=await fetch(apiURL('/api/storage/upload',currentPath),{method:'POST',body:form});
-    const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'Upload failed');
+    const data=await readApiResponse(response);
     picker.value='';await loadDirectory();
     if(data.message)summaryEl.textContent=data.message;
   }catch(error){summaryEl.textContent='Upload failed';alert(error.message);await loadDirectory();}
@@ -588,7 +660,7 @@ void handleStorageRedirect() {
 // ============================================================
 
 void handleStorageList() {
-  if (!requireAuthentication()) return;
+  if (!requireAuthentication(true)) return;
 
   String absolutePath;
   if (!makeStoragePath(server.arg("path"), absolutePath, true)) {
@@ -635,7 +707,7 @@ void handleStorageList() {
 }
 
 void handleStorageDownload() {
-  if (!requireAuthentication()) return;
+  if (!requireAuthentication(true)) return;
 
   String absolutePath;
   if (!makeStoragePath(server.arg("path"), absolutePath, false)) {
@@ -663,6 +735,9 @@ String extractUploadFilename(String filename) {
 }
 
 void handleStorageUploadData() {
+
+  Serial.printf("[UPLOAD] Status: %d | URI: %s\n",
+              server.upload().status, server.uri().c_str());
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
@@ -671,9 +746,11 @@ void handleStorageUploadData() {
       uploadError = "";
       uploadAnyFileSucceeded = false;
     }
-    uploadAuthorized = server.authenticate(AUTH_USERNAME, AUTH_PASSWORD);
+
+    uploadAuthorized = hasValidSession();
     uploadCurrentFileAccepted = false;
     uploadCurrentTarget = "";
+
     if (uploadFile) uploadFile.close();
 
     if (!uploadAuthorized) return;
@@ -690,6 +767,7 @@ void handleStorageUploadData() {
     File destination = SD.open(uploadTargetDirectory, FILE_READ);
     bool destinationIsDirectory = destination && destination.isDirectory();
     if (destination) destination.close();
+
     if (!destinationIsDirectory) {
       if (uploadError.length() == 0) uploadError = "Destination folder does not exist";
       return;
@@ -712,14 +790,17 @@ void handleStorageUploadData() {
       if (uploadError.length() == 0) uploadError = "Could not create file: " + safeFilename;
       return;
     }
+
     uploadCurrentTarget = target;
     uploadCurrentFileAccepted = true;
   }
 
   if (upload.status == UPLOAD_FILE_WRITE) {
     if (!uploadAuthorized || !uploadCurrentFileAccepted || !uploadFile) return;
+
     size_t written = uploadFile.write(upload.buf, upload.currentSize);
     tunnel.loop();
+
     if (written != upload.currentSize) {
       if (uploadError.length() == 0) uploadError = "microSD write failed";
       uploadFile.close();
@@ -730,27 +811,39 @@ void handleStorageUploadData() {
 
   if (upload.status == UPLOAD_FILE_END) {
     if (uploadFile) uploadFile.close();
-    if (uploadAuthorized && uploadCurrentFileAccepted) uploadAnyFileSucceeded = true;
+
+    if (uploadAuthorized && uploadCurrentFileAccepted) {
+      uploadAnyFileSucceeded = true;
+    }
+
     uploadCurrentFileAccepted = false;
     uploadCurrentTarget = "";
   }
 
   if (upload.status == UPLOAD_FILE_ABORTED) {
     if (uploadFile) uploadFile.close();
-    if (uploadCurrentTarget.length() > 0) SD.remove(uploadCurrentTarget);
+
+    if (uploadCurrentTarget.length() > 0) {
+      SD.remove(uploadCurrentTarget);
+    }
+
     uploadCurrentTarget = "";
     uploadCurrentFileAccepted = false;
-    uploadRequestStarted = false;
-    if (uploadError.length() == 0) uploadError = "Upload was interrupted";
+
+    if (uploadError.length() == 0) {
+      uploadError = "Upload was interrupted";
+    }
   }
 }
 
 void handleStorageUploadComplete() {
-  if (!requireAuthentication()) {
+  Serial.printf("[UPLOAD COMPLETE] URI: %s\n", server.uri().c_str());
+  if (!hasValidSession()) {
     if (uploadFile) uploadFile.close();
     uploadRequestStarted = false;
     uploadAnyFileSucceeded = false;
     uploadError = "";
+    server.send(401, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"Please log in again\"}");
     return;
   }
 
@@ -800,7 +893,7 @@ void handleWebsiteUploadData() {
 
   if (upload.status == UPLOAD_FILE_START) {
     if (websiteUploadFile) websiteUploadFile.close();
-    websiteUploadAuthorized = server.authenticate(AUTH_USERNAME, AUTH_PASSWORD);
+    websiteUploadAuthorized = hasValidSession();
     websiteUploadCurrentFileAccepted = false;
     websiteUploadCurrentTarget = "";
     if (!websiteUploadAuthorized) return;
@@ -902,11 +995,12 @@ void handleWebsiteUploadData() {
 }
 
 void handleWebsiteUploadComplete() {
-  if (!requireAuthentication()) {
+  if (!hasValidSession()) {
     if (websiteUploadFile) websiteUploadFile.close();
     websiteUploadSiteName = "";
     websiteUploadAnyFileSucceeded = false;
     websiteUploadError = "";
+    server.send(401, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"Please log in again\"}");
     return;
   }
   if (websiteUploadFile) websiteUploadFile.close();
@@ -940,6 +1034,23 @@ void handleWebsiteUploadComplete() {
   websiteUploadAnyFileSucceeded = false;
   discoverWebsites();
   server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"message\":\"Website uploaded\"}");
+}
+
+void handleStorageMakeDirectory() {
+  if (!requireAuthentication(true)) return;
+  String parentPath;
+  if (!makeStoragePath(server.arg("path"), parentPath, true)) { sendJsonError(400, "Invalid parent folder"); return; }
+  String name = server.arg("name");
+  name.trim();
+  if (!isSafeSegment(name)) { sendJsonError(400, "Invalid folder name"); return; }
+  File parent = SD.open(parentPath, FILE_READ);
+  bool parentIsDirectory = parent && parent.isDirectory();
+  if (parent) parent.close();
+  if (!parentIsDirectory) { sendJsonError(404, "Parent folder not found"); return; }
+  String target = joinPath(parentPath, name);
+  if (SD.exists(target)) { sendJsonError(409, "An item with that name already exists"); return; }
+  if (!SD.mkdir(target)) { sendJsonError(500, "Could not create folder on microSD"); return; }
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
 bool deleteRecursively(const String& path, uint8_t depth = 0) {
@@ -988,7 +1099,7 @@ bool deleteRecursively(const String& path, uint8_t depth = 0) {
 }
 
 void handleStorageDelete() {
-  if (!requireAuthentication()) return;
+  if (!requireAuthentication(true)) return;
 
   String absolutePath;
   if (!makeStoragePath(server.arg("path"), absolutePath, false)) {
@@ -1278,7 +1389,7 @@ bool streamZipArchive(ClientType& client,
 }
 
 void handleStorageZipDownload() {
-  if (!requireAuthentication()) return;
+  if (!requireAuthentication(true)) return;
 
   String relativePath;
   if (!normalizeRelativePath(server.arg("path"), relativePath) || relativePath.length() == 0) {
@@ -1345,6 +1456,8 @@ bool isPathOrChildOf(const String& path, const String& base) {
 }
 
 void handleNotFound() {
+  Serial.printf("[HTTP ERROR] Method: %d | URI: %s\n",
+              server.method(), server.uri().c_str());
   String requestPath = WebServer::urlDecode(server.uri());
   if (!requestPath.startsWith("/")) requestPath = "/" + requestPath;
 
@@ -1360,14 +1473,17 @@ void handleNotFound() {
       server.send(302, "text/plain", "Redirecting to storage");
       return;
     }
-    server.send_P(200, PSTR("text/html; charset=utf-8"), STORAGE_HTML);
-    return;
+sendProgmemInChunks(
+  STORAGE_HTML,
+  sizeof(STORAGE_HTML) - 1,
+  "text/html; charset=utf-8"
+);    return;
   }
 
   // Protect the complete API namespace, including unknown API endpoints.
   if (isPathOrChildOf(requestPath, "/api") || isPathOrChildOf(requestPath, "/config")) {
-    if (!requireAuthentication()) return;
-    server.send(404, "text/plain", "Not found");
+    if (!requireAuthentication(true)) return;
+    sendJsonError(404, "Not found");
     return;
   }
 
@@ -1383,6 +1499,9 @@ void handleNotFound() {
 }
 
 void registerRoutes() {
+  server.on("/login", HTTP_GET, handleLoginPage);
+  server.on("/login", HTTP_POST, handleLoginSubmit);
+  server.on("/logout", HTTP_POST, handleLogout);
   server.on("/", HTTP_GET, handleHomePage);
 
   server.on("/storage", HTTP_GET, handleStorageRedirect);
@@ -1392,6 +1511,7 @@ void registerRoutes() {
   server.on("/api/storage/download", HTTP_GET, handleStorageDownload);
   server.on("/api/storage/zip", HTTP_GET, handleStorageZipDownload);
   server.on("/api/storage/delete", HTTP_POST, handleStorageDelete);
+  server.on("/api/storage/mkdir", HTTP_POST, handleStorageMakeDirectory);
   server.on("/api/storage/upload", HTTP_POST,
             handleStorageUploadComplete, handleStorageUploadData);
 
@@ -1410,7 +1530,7 @@ void setup() {
   delay(300);
   Serial.println();
   Serial.println("====================================");
-  Serial.println("       PicoCloud v0.7 starting");
+  Serial.println("       PicoCloud v0.8 starting");
   Serial.println("====================================");
 
   // Start SPI using the wiring used by the PicoCloud prototype.
@@ -1454,6 +1574,8 @@ void setup() {
     Serial.println("[Wi-Fi] Initial connection timed out. The device will keep trying.");
   }
 
+  const char* headerKeys[] = {"Cookie"};
+  server.collectHeaders(headerKeys, 1);
   registerRoutes();
   server.begin();
   Serial.println("[HTTP] Web server started on port 80.");
@@ -1479,7 +1601,7 @@ void setup() {
     Serial.println("[SuperDMZ] Wi-Fi is not connected yet; tunnel will start after reconnection.");
   }
 
-  Serial.println("[AUTH] Website folders are public; dashboard, storage and APIs require login.");
+  Serial.println("[AUTH] Website folders are public; dashboard and storage require login sessions.");
 }
 
 void loop() {
