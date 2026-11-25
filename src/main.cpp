@@ -3,16 +3,21 @@
 #include <SPI.h>
 #include <SD.h>
 #include <vector>
+#include <SuperDMZ.h>
 
 // ============================================================
-// PICOCloud v0.6
-// Public website hosting + authenticated personal storage
+// PICOCloud v0.7
+// Public website hosting + authenticated personal storage + SuperDMZ remote access
 // ============================================================
 
 // ------------------------- Wi-Fi -----------------------------
 // Keep the Wi-Fi credentials that already work in your v0.5 code.
 const char* WIFI_SSID = "LUTTAPPI";
 const char* WIFI_PASSWORD = "umarabdullaf";
+
+// Paste the 48-character token from your SuperDMZ tunnel dashboard here.
+// Do not share this token publicly.
+const char* SUPERDMZ_TOKEN = "0e35cd9461fd9b2299600df13e3631894c4779cb0f779f53";
 
 // ---------------------- Authentication -----------------------
 // Change BOTH values before using PicoCloud.
@@ -37,8 +42,10 @@ static const size_t MAX_ZIP_ENTRIES = 120;
 static const uint8_t MAX_DELETE_DEPTH = 16;
 
 WebServer server(HTTP_PORT);
+SuperDMZ tunnel;
 std::vector<String> publicWebsites;
 bool sdReady = false;
+bool tunnelStartAttempted = false;
 
 // Upload state. WebServer calls the upload callback for each multipart
 // file; this state is reset whenever a new file starts.
@@ -205,6 +212,59 @@ void sendJsonError(int statusCode, const String& message) {
   server.send(statusCode, "application/json; charset=utf-8", body);
 }
 
+
+// Send larger responses in small pieces. SuperDMZ must be serviced while
+// WebServer is writing, otherwise its WebSocket bridge can stop draining.
+void sendStringInChunks(const String& content, const char* contentType) {
+  server.setContentLength(content.length());
+  server.send(200, contentType, "");
+  const size_t chunkSize = 1024;
+  for (size_t offset = 0; offset < content.length(); offset += chunkSize) {
+    size_t count = content.length() - offset;
+    if (count > chunkSize) count = chunkSize;
+    String chunk = content.substring(offset, offset + count);
+    server.sendContent(chunk);
+    tunnel.loop();
+    yield();
+  }
+}
+
+void sendProgmemInChunks(const char* content, size_t contentLength,
+                         const char* contentType) {
+  server.setContentLength(contentLength);
+  server.send(200, contentType, "");
+  char chunk[1025];
+  size_t offset = 0;
+  while (offset < contentLength) {
+    size_t count = contentLength - offset;
+    if (count > 1024) count = 1024;
+    for (size_t i = 0; i < count; ++i) {
+      chunk[i] = static_cast<char>(pgm_read_byte(content + offset + i));
+    }
+    chunk[count] = '\0';
+    server.sendContent(String(chunk));
+    offset += count;
+    tunnel.loop();
+    yield();
+  }
+}
+
+// Stream an SD file in bounded chunks so the reverse tunnel remains active.
+void streamFileThroughTunnel(File& file, const String& filename) {
+  const size_t chunkSize = 1024;
+  const size_t totalSize = file.size();
+  server.setContentLength(totalSize);
+  server.send(200, getContentType(filename), "");
+  uint8_t buffer[chunkSize];
+  while (file.available()) {
+    size_t count = file.read(buffer, sizeof(buffer));
+    if (count == 0) break;
+    server.sendContent(reinterpret_cast<const char*>(buffer), count);
+    tunnel.loop();
+    yield();
+  }
+}
+
 // ============================================================
 // WEBSITE DISCOVERY AND PUBLIC WEBSITE HOSTING
 // ============================================================
@@ -311,7 +371,7 @@ folderInput.addEventListener('change',async()=>{
 </script>
 </main></body></html>
 )PICOJS");
-  server.send(200, "text/html; charset=utf-8", html);
+  sendStringInChunks(html, "text/html; charset=utf-8");
 }
 
 bool servePublicWebsite(String requestPath) {
@@ -352,7 +412,7 @@ bool servePublicWebsite(String requestPath) {
     return true;
   }
 
-  server.streamFile(file, getContentType(diskPath));
+  streamFileThroughTunnel(file, diskPath);
   file.close();
   return true;
 }
@@ -513,7 +573,8 @@ loadDirectory();
 
 void handleStoragePage() {
   if (!requireAuthentication()) return;
-  server.send_P(200, PSTR("text/html; charset=utf-8"), STORAGE_HTML);
+  sendProgmemInChunks(STORAGE_HTML, sizeof(STORAGE_HTML) - 1,
+                      "text/html; charset=utf-8");
 }
 
 void handleStorageRedirect() {
@@ -565,6 +626,7 @@ void handleStorageList() {
     item += isDirectory ? "dir" : "file";
     item += "\",\"size\":" + String(fileSize) + "}";
     server.sendContent(item);
+    tunnel.loop();
     delay(0);
   }
 
@@ -590,7 +652,7 @@ void handleStorageDownload() {
 
   String filename = lastPathSegment(absolutePath);
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
-  server.streamFile(file, getContentType(filename));
+  streamFileThroughTunnel(file, filename);
   file.close();
 }
 
@@ -657,6 +719,7 @@ void handleStorageUploadData() {
   if (upload.status == UPLOAD_FILE_WRITE) {
     if (!uploadAuthorized || !uploadCurrentFileAccepted || !uploadFile) return;
     size_t written = uploadFile.write(upload.buf, upload.currentSize);
+    tunnel.loop();
     if (written != upload.currentSize) {
       if (uploadError.length() == 0) uploadError = "microSD write failed";
       uploadFile.close();
@@ -813,6 +876,7 @@ void handleWebsiteUploadData() {
   if (upload.status == UPLOAD_FILE_WRITE) {
     if (!websiteUploadAuthorized || !websiteUploadCurrentFileAccepted || !websiteUploadFile) return;
     size_t written = websiteUploadFile.write(upload.buf, upload.currentSize);
+    tunnel.loop();
     if (written != upload.currentSize) {
       if (websiteUploadError.length() == 0) websiteUploadError = "microSD write failed";
       websiteUploadFile.close();
@@ -991,6 +1055,7 @@ bool calculateFileCRC(const String& path, uint32_t& fileSize, uint32_t& resultCR
     if (count == 0) break;
     crc = crc32Update(crc, buffer, count);
     totalRead += count;
+    tunnel.loop();
     yield();
   }
 
@@ -1069,7 +1134,9 @@ bool writeClientFully(ClientType& client, const uint8_t* data, size_t length) {
     if (n > 0) {
       sent += n;
       lastProgress = millis();
+      tunnel.loop();
     } else {
+      tunnel.loop();
       if (millis() - lastProgress > 5000) return false;
       delay(1);
     }
@@ -1117,6 +1184,7 @@ bool writeZipFileData(ClientType& client, const ZipEntry& entry) {
       break;
     }
     totalSent += count;
+    tunnel.loop();
     yield();
   }
   file.close();
@@ -1342,7 +1410,7 @@ void setup() {
   delay(300);
   Serial.println();
   Serial.println("====================================");
-  Serial.println("       PicoCloud v0.6 starting");
+  Serial.println("       PicoCloud v0.7 starting");
   Serial.println("====================================");
 
   // Start SPI using the wiring used by the PicoCloud prototype.
@@ -1389,6 +1457,28 @@ void setup() {
   registerRoutes();
   server.begin();
   Serial.println("[HTTP] Web server started on port 80.");
+
+  tunnel.onStatus([](bool online, const char* publicUrl) {
+    if (online) {
+      Serial.print("[SuperDMZ] ONLINE: ");
+      Serial.println(publicUrl);
+    } else {
+      Serial.println("[SuperDMZ] Tunnel offline; the library will reconnect automatically.");
+    }
+  });
+
+  if (String(SUPERDMZ_TOKEN) == "PASTE_YOUR_48_CHARACTER_TOKEN_HERE") {
+    Serial.println("[SuperDMZ] TOKEN NOT SET. Add your 48-character tunnel token in SUPERDMZ_TOKEN.");
+  } else if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[SuperDMZ] Starting reverse tunnel...");
+    tunnelStartAttempted = true;
+    if (!tunnel.begin(SUPERDMZ_TOKEN, HTTP_PORT)) {
+      Serial.println("[SuperDMZ] Could not start tunnel. Check token and tunnel configuration.");
+    }
+  } else {
+    Serial.println("[SuperDMZ] Wi-Fi is not connected yet; tunnel will start after reconnection.");
+  }
+
   Serial.println("[AUTH] Website folders are public; dashboard, storage and APIs require login.");
 }
 
@@ -1399,6 +1489,7 @@ void loop() {
   }
 
   static unsigned long lastReconnectAttempt = 0;
+
   if (WiFi.status() != WL_CONNECTED && millis() - lastReconnectAttempt > 10000) {
     lastReconnectAttempt = millis();
     Serial.println("[Wi-Fi] Reconnecting...");
@@ -1406,6 +1497,16 @@ void loop() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   }
 
+  if (WiFi.status() == WL_CONNECTED && !tunnelStartAttempted &&
+      String(SUPERDMZ_TOKEN) != "PASTE_YOUR_48_CHARACTER_TOKEN_HERE") {
+    tunnelStartAttempted = true;
+    Serial.println("[SuperDMZ] Starting reverse tunnel after Wi-Fi reconnection...");
+    if (!tunnel.begin(SUPERDMZ_TOKEN, HTTP_PORT)) {
+      Serial.println("[SuperDMZ] Initial tunnel start failed; check the token.");
+    }
+  }
+
   server.handleClient();
-  delay(2);
+  tunnel.loop();
+  delay(1);
 }
